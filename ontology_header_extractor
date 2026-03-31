@@ -1,0 +1,110 @@
+@dataclass
+class OntologyType:
+    name: str          # "FAMILY_RELATION"
+    description: str   # "Biological or legal relationships between persons (spouse, parent, sibling...)"
+
+@dataclass
+class WantedHeader:
+    raw_text: str          # "wife"
+    normalized: str        # "spouse"
+    ont_type: str          # must be one of the provided OntologyType.name values
+    confidence: float
+
+@dataclass
+class WantedHeadersResult:
+    query: str
+    headers: list[WantedHeader]
+
+EXTRACTION_PROMPT = """
+You are an ontological header extractor for an enterprise data system.
+
+Your task:
+Given a natural language query, extract the WANTED HEADERS — the attributes or 
+relations the user is requesting about the subject — and classify each one 
+into the organization's ontology type list below.
+
+Rules:
+- A wanted header is the PREDICATE, not the subject.
+- You MUST classify each header into one of the provided ontology types.
+- If no type fits well, pick the closest and lower the confidence score.
+- Never invent new ontology type names.
+
+Organization ontology types:
+{ontology_catalog}
+
+Examples of subject vs header:
+  "who is donald trump's wife"      → header: "wife",         raw="wife"
+  "what is acme corp's revenue"     → header: "revenue",      raw="revenue"
+  "when did john leave the company" → header: "end date",     raw="leave"
+
+Subject ontology type (if known): {subject_ont_type}
+
+Return a JSON array. Each item:
+{{
+  "raw_text":   string,   // exact word(s) from the query
+  "normalized": string,   // canonical form
+  "ont_type":   string,   // MUST be from the provided ontology type list
+  "confidence": float     // 0.0–1.0, lower if the match is approximate
+}}
+
+Return ONLY the JSON array. No explanation.
+
+Query: {query}
+"""
+
+def _format_catalog(ontology_types: list[OntologyType]) -> str:
+    return "\n".join(
+        f"- {ot.name}: {ot.description}"
+        for ot in ontology_types
+    )
+
+async def extract_wanted_headers(
+    query: str,
+    ontology_types: list[OntologyType],       # your org's catalog
+    subject_ont_type: str | None = None,      # optional, improves disambiguation
+) -> WantedHeadersResult:
+
+    prompt = EXTRACTION_PROMPT.format(
+        ontology_catalog=_format_catalog(ontology_types),
+        subject_ont_type=subject_ont_type or "unknown",
+        query=query,
+    )
+
+    response = await claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+    headers_data = json.loads(raw)
+
+    # validate all returned ont_types are in the catalog
+    valid_names = {ot.name for ot in ontology_types}
+    for h in headers_data:
+        if h["ont_type"] not in valid_names:
+            raise ValueError(f"Model returned unknown ont_type: {h['ont_type']}")
+
+    return WantedHeadersResult(
+        query=query,
+        headers=[WantedHeader(**h) for h in headers_data]
+    )
+
+
+org_ontology = [
+    OntologyType("FAMILY_RELATION", "Biological or legal relationships between persons (spouse, parent, sibling)"),
+    OntologyType("FINANCIAL",       "Monetary values, balances, revenue, payments"),
+    OntologyType("HR",              "Employment data: role, start date, end date, department"),
+    OntologyType("CONTRACT",        "Agreement terms, signature dates, clauses, parties"),
+    OntologyType("CONTACT_INFO",    "Phone, email, address of a person or organization"),
+    # ... your full list
+]
+
+result = await extract_wanted_headers(
+    query="who is donald trump's wife",
+    ontology_types=org_ontology,
+    subject_ont_type="PERSONNAME"
+)
+
+# result.headers → [WantedHeader(raw_text="wife", normalized="spouse", ont_type="FAMILY_RELATION", confidence=0.97)]
+
